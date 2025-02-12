@@ -1,0 +1,3 @@
+[submodule "themes/oasis"]
+	path = themes/oasis
+	url = git@github.com:lingdie/hexo-theme-oasis.git
