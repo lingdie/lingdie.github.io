@@ -141,6 +141,36 @@
   </entry>
   
   <entry>
+    <title>OCI 规范入门与 Sealos 集群镜像实现原理</title>
+    <link href="https://lingdie.github.io/2024/10/16/oci-spec-and-sealos-cluster-image/"/>
+    <id>https://lingdie.github.io/2024/10/16/oci-spec-and-sealos-cluster-image/</id>
+    <published>2024-10-16T13:20:00.000Z</published>
+    <updated>2026-11-12T08:34:14.612Z</updated>
+    
+    <content type="html"><![CDATA[<p>使用 Docker、containerd 时都会接触到 OCI（Open Container Initiative）。常见理解是「镜像对应一个容器运行环境」，但 Image Spec 与 Distribution Spec 并不要求镜像内容必须是可执行进程。Sealos 的集群镜像沿用同一套 OCI 格式，将 Kubernetes 相关物料——宿主机二进制、配置模板、Helm Chart，以及依赖的业务容器镜像——一并打包为可分发制品。</p><p>下文先说明与此相关的 OCI 结构，再结合 <code>sealos/lifecycle</code> 的实现说明集群镜像的构建与运行过程。</p><h2 id="OCI-相关概念"><a href="#OCI-相关概念" class="headerlink" title="OCI 相关概念"></a>OCI 相关概念</h2><p>OCI 包含三份规范：</p><ul><li>Image Spec：镜像在磁盘上的组成与元数据格式</li><li>Distribution Spec：客户端与 Registry 的拉取、推送协议（沿用 Docker Registry HTTP API V2）</li><li>Runtime Spec：<code>runc</code> 等运行时在拿到 rootfs 与 <code>config.json</code> 后如何创建进程</li></ul><p>集群镜像主要依赖前两份。由于集群镜像不会作为普通容器由 <code>runc</code> 启动，Runtime Spec 基本不参与这条链路。</p><h3 id="镜像对象结构"><a href="#镜像对象结构" class="headerlink" title="镜像对象结构"></a>镜像对象结构</h3><p>Registry 以内容寻址方式存储对象，键为 <code>sha256</code> digest，对象统称为 Blob。关联关系由下列结构描述：</p><p><strong>Image Index</strong>（多架构时使用）<br>媒体类型为 <code>application/vnd.oci.image.index.v1+json</code>。例如拉取 <code>kubernetes:v1.29.0</code> 时，Index 中记录 <code>linux/amd64</code>、<code>linux/arm64</code> 各自对应的 Manifest digest，客户端按本机架构选择其一。</p><p><strong>Image Manifest</strong><br>单个架构的清单。本身不包含 Env、Cmd，作用是引用一份 Config，并按顺序列出各 Layer 的 <code>mediaType</code>、<code>digest</code>、<code>size</code>。</p><p><strong>Image Configuration</strong><br>对应 <code>docker inspect</code> 中的大部分字段，主要包括：</p><ul><li><code>config</code>：<code>Env</code>、<code>Entrypoint</code>、<code>Cmd</code>、<code>Labels</code>、<code>WorkingDir</code> 等</li><li><code>rootfs.diff_ids</code>：各层解压后 tar 的 sha256（Manifest 中记录的是压缩后 digest）</li><li><code>history</code>：构建历史</li></ul><p><strong>Filesystem Layers</strong><br><code>.tar.gz</code> 或 <code>.tar.zst</code> 包，按顺序叠加；删除通过 <code>.wh.&lt;filename&gt;</code>（whiteout）表示，叠加结果即为 rootfs。</p><p>若不调用 <code>runc</code>，Image Spec 实质上是带 Labels &#x2F; Env &#x2F; Cmd 的分层归档，并可复用现有 Registry 基础设施。Helm Chart 推送到 OCI、Wasm 制品 OCI 化，以及 Sealos 集群镜像，均基于这一能力。</p><h2 id="Sealos-集群镜像"><a href="#Sealos-集群镜像" class="headerlink" title="Sealos 集群镜像"></a>Sealos 集群镜像</h2><p>离线部署 Kubernetes 的难点通常不在 <code>kubeadm init</code> 本身，而在物料组织：kubelet、containerd 等二进制，内核与系统配置脚本，CNI 与组件 YAML、Charts，以及大量业务镜像。传统方式多为大型 tar 包配合 Ansible，版本或组件变更时往往需要整包重建。</p><p><code>lifecycle</code> 基于 <code>containers/storage</code> 与 <code>buildah</code>，通过 OCI Config 中的 <code>sealos.io.type</code> 将镜像分为三类：</p><ul><li><code>rootfs</code>：集群底座，例如 <code>labring/kubernetes:v1.29.0</code>，包含 kubeadm、kubelet、kubectl、containerd、image-cri-shim、sealctl，以及 systemd unit 与初始配置。集群必须先应用 <code>rootfs</code>。</li><li><code>patch</code>：对底座的增量补丁，与 <code>rootfs</code> 一样同步到全部节点。</li><li><code>application</code>：网络插件、Ingress、业务 Chart 等。默认仅分发到 <code>master0</code> 执行 apply 或 helm。</li></ul><h3 id="构建过程"><a href="#构建过程" class="headerlink" title="构建过程"></a>构建过程</h3><p><code>Kubefile</code> &#x2F; <code>Sealfile</code> 语法与 Dockerfile 兼容，<code>pkg/buildah/build.go</code> 调用 <code>imagebuildah.BuildDockerfiles</code> 生成标准 OCI 镜像。额外步骤由 <code>runSaveImages</code>（<code>pkg/buildah/imagesaver.go</code>）完成：</p><ol><li>扫描构建上下文中的镜像引用：<ul><li><code>charts/</code>：Helm 渲染结果中的镜像</li><li><code>manifests/</code>：YAML 与 <code>.tmpl</code> 中的 <code>image:</code></li><li><code>images/shim/</code>：显式镜像列表，支持 <code>.sealignore</code>；<code>images/skopeo/</code> 可导入 <code>docker-archive</code> &#x2F; <code>oci-archive</code></li></ul></li><li>不采用对每个镜像单独 <code>docker save</code> 的方式（公共层难以去重）。<code>SaveImages</code> 在本机 <code>127.0.0.1</code> 启动临时 Distribution Registry，将存储根目录指向上下文中的 <code>registry/</code>，再按目标 <code>platform</code> 将依赖镜像并发推入该目录。</li><li>落盘完成后，buildah 继续执行 <code>COPY</code> 等指令，将二进制、YAML、Charts 与已形成 <code>/v2/blobs/sha256/...</code> 结构的 <code>registry/</code> 一并写入镜像层。</li></ol><p>结果仍是合规 OCI 镜像，内部 Blob 可去重，并可 <code>sealos push</code> 至 Docker Hub、GHCR、Harbor 等仓库。</p><p>若需合并多个镜像，<code>pkg/image/merge.go</code> 中的 <code>MergeDockerfileFromImages</code> 读取各源镜像 Config，合并 Labels、Env、Entrypoint、Cmd，生成以 <code>FROM scratch</code> 开头、包含多条 <code>COPY --from=...</code> 的 Containerfile 再构建。</p><h3 id="运行过程"><a href="#运行过程" class="headerlink" title="运行过程"></a>运行过程</h3><p>执行 <code>sealos run labring/kubernetes:v1.29.0 labring/cilium:v1.14.1 --masters ... --nodes ...</code> 时，集群镜像不会作为容器进程启动。编排由 <code>CreateProcessor</code>（<code>pkg/apply/processor/create.go</code>）完成：</p><pre><code class="language-text">Check -&gt; PreProcess -&gt; RunConfig -&gt; MountRootfs -&gt; MirrorRegistry -&gt; Bootstrap -&gt; Init -&gt; Join -&gt; RunGuest</code></pre><p>与 OCI 关联较紧的步骤如下。</p><p><strong>PreProcess</strong><br><code>MountClusterImages</code> 先 <code>buildah.Pull</code>，再 <code>buildah.Create</code> 获取 Overlay 挂载点。<code>OCIToImageMount</code> 读取 OCI Config：</p><ul><li>Labels 中的 <code>sealos.io.type</code>（rootfs &#x2F; patch &#x2F; application）与 K8s 版本</li><li>Env，并与 Clusterfile、命令行 <code>--env</code> 合并</li><li>Entrypoint &#x2F; Cmd（去除 <code>/bin/sh -c</code> 包装），供后续 RunGuest 使用</li></ul><p>原先面向 Runtime 的配置字段，在此作为安装参数与入口命令使用。</p><p><strong>MountRootfs</strong><br><code>pkg/filesystem/rootfs/rootfs_default.go</code> 负责将文件分发到目标主机：</p><ul><li>rootfs &#x2F; patch：通过 SSH 同步除 <code>registry/</code> 以外的内容到各节点（例如 <code>/var/lib/sealos/data/default/rootfs</code>），再执行 <code>sealctl render</code> 渲染 <code>.tmpl</code></li><li>application：仅同步到 master0 的应用工作目录（<code>.../applications/&lt;name&gt;/workdir</code>）</li></ul><p><strong>MirrorRegistry</strong><br>构建阶段写入 <code>registry/</code> 的业务镜像，在此同步到集群仓库节点（<code>pkg/filesystem/registry/sync.go</code>）。</p><p>直接整目录拷贝会导致无关 Blob 的重复传输。<code>Sync</code> 优先在目标节点执行 <code>sealctl registry serve</code>，临时启动监听 <code>5050</code> 的 HTTP Registry（数据目录为 <code>/var/lib/registry</code>），管理机再通过 <code>containers/image</code> 的 copy 协议做增量同步；若无法启动临时服务，则回退为 SSH 目录同步。采用标准 Distribution 协议时，目标端已有 Blob 可在 HEAD 阶段跳过。</p><p><strong>image-cri-shim</strong><br><code>kubeadm init</code> 与业务 YAML 中的镜像名仍可能是外网地址（如 <code>registry.k8s.io/pause:3.9</code>），而实际数据位于 <code>sealos.hub:5000</code>。逐一改写 Chart 与 YAML 中的域名成本高且易遗漏。</p><p>节点侧部署 <code>image-cri-shim</code>：kubelet 的 CRI endpoint 先连接 shim，再转发至 containerd。处理 <code>PullImage</code>、<code>ImageStatus</code> 等请求时，shim 用原始镜像名查询私有仓库（带 LRU 缓存），命中后改写为内部地址并注入认证，再交给 containerd。上层清单无需修改，在线与离线可共用同一集群镜像。</p><p><strong>RunGuest</strong><br>在 Bootstrap、Init、Join（含 lvscare 静态 Pod 提供本机 IPVS）完成后，按挂载顺序执行：</p><ul><li>rootfs &#x2F; patch：在全部节点并发执行 Config 中的 Entrypoint 与 Cmd</li><li>application：仅在 master0、进入对应工作目录，注入合并后的 Env，再执行 Entrypoint 与 Cmd（如 <code>helm upgrade</code>、<code>kubectl apply</code>）</li></ul><h2 id="最小示例"><a href="#最小示例" class="headerlink" title="最小示例"></a>最小示例</h2><p>将带 YAML 的组件打包为 application 集群镜像，目录可如下：</p><pre><code class="language-text">my-app/├── Kubefile└── manifests/    └── deploy.yaml    # 使用 ghcr.io/xxx/app:v1.0.0 等镜像地址</code></pre><p><code>Kubefile</code>：</p><pre><code class="language-dockerfile">FROM scratchENV REPLICAS=&quot;2&quot;COPY manifests ./manifestsCMD [&quot;kubectl apply -f manifests/deploy.yaml&quot;]</code></pre><p>在可访问外网的构建机上：</p><pre><code class="language-bash">sealos build -t hub.example.com/infra/my-app:v1.0.0 -f Kubefile .</code></pre><p>构建过程会解析 YAML 中的业务镜像，按 Registry Blob 格式写入镜像内 <code>registry/</code>，并将 <code>ENV</code>、<code>CMD</code> 写入 OCI Config。</p><p>将镜像分发到目标环境后：</p><pre><code class="language-bash">sealos run hub.example.com/infra/my-app:v1.0.0</code></pre><p>业务镜像同步至集群内部仓库，并在 master0 执行安装命令。整条链路未引入新的打包格式，而是复用 OCI 的分层文件系统、Config 元数据与 Distribution 协议。</p>]]></content>
+    
+    
+      
+      
+    <summary type="html">&lt;p&gt;使用 Docker、containerd 时都会接触到 OCI（Open Container Initiative）。常见理解是「镜像对应一个容器运行环境」，但 Image Spec 与 Distribution Spec 并不要求镜像内容必须是可执行进程。Sealos 的</summary>
+      
+    
+    
+    
+    <category term="Cloud Native" scheme="https://lingdie.github.io/categories/Cloud-Native/"/>
+    
+    
+    <category term="kubernetes" scheme="https://lingdie.github.io/tags/kubernetes/"/>
+    
+    <category term="oci" scheme="https://lingdie.github.io/tags/oci/"/>
+    
+    <category term="sealos" scheme="https://lingdie.github.io/tags/sealos/"/>
+    
+    <category term="container" scheme="https://lingdie.github.io/tags/container/"/>
+    
+  </entry>
+  
+  <entry>
     <title>Kubebuilder 开发笔记：Status、Reconciler 与 Webhook</title>
     <link href="https://lingdie.github.io/2024/09/18/kubebuilder-operator-status-reconciler/"/>
     <id>https://lingdie.github.io/2024/09/18/kubebuilder-operator-status-reconciler/</id>
@@ -163,11 +193,11 @@
     
     <category term="kubernetes" scheme="https://lingdie.github.io/tags/kubernetes/"/>
     
-    <category term="kubebuilder" scheme="https://lingdie.github.io/tags/kubebuilder/"/>
-    
     <category term="operator" scheme="https://lingdie.github.io/tags/operator/"/>
     
     <category term="controller-runtime" scheme="https://lingdie.github.io/tags/controller-runtime/"/>
+    
+    <category term="kubebuilder" scheme="https://lingdie.github.io/tags/kubebuilder/"/>
     
   </entry>
   
