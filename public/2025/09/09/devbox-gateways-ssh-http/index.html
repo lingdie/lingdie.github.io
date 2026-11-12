@@ -1,0 +1,45 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>DevBox 总结（三）：SSHGate 与 HTTPGate 接入网关设计 │ lingdie's blog</title><link rel="stylesheet" href="/css/oasis.css"><meta name="generator" content="Hexo 7.3.0"><link rel="alternate" href="/atom.xml" title="lingdie's blog" type="application/atom+xml">
+</head><body><div id="content"><h1 id="title">DevBox 总结（三）：SSHGate 与 HTTPGate 接入网关设计</h1><div id="menu-outer"><nav id="menu-inner"><a id="menu-back" href="javascript:history.back()">Back</a><time datetime="2025-09-09T14:05:00.000Z">2025-09-09</time></nav></div><div id="content-outer"><div id="content-inner"><article id="post"><p>云端开发环境建起来之后，外部流量进容器主要有两条路：一条是开发者的 IDE（VS Code Remote、Cursor、JetBrains Gateway）或者终端连 SSH；另一条是用户在容器里跑了个 Web 服务或者 gRPC 服务，想直接通过浏览器或客户端调试端口。</p>
+<p>早期最省事的做法是给每个 DevBox 建一个 NodePort Service，SSH 走一个端口，业务端口再开别的。但集群规模一上来问题就很明显：NodePort 默认端口池（30000-32767）就两千多个，实例一多连 paused 状态的机器都占着坑；而且节点公网暴露面太大，防火墙和安全组很难收敛。另外，如果每个临时预览端口都去建一套 Service + Ingress，Ingress Controller 频繁 reload 配置的开销也不小。</p>
+<p>所以在 v2 里我们把这两块收敛成了两个专门的网关：<code>sshgate</code>（Go 写的四层&#x2F;SSH 协议网关）和 <code>httpgate</code>（Rust 基于 Pingora 写的七层动态路由网关），统一直接转发到后端的 Pod IP。</p>
+<h2 id="SSHGate：共用单端口的公钥路由网关"><a href="#SSHGate：共用单端口的公钥路由网关" class="headerlink" title="SSHGate：共用单端口的公钥路由网关"></a>SSHGate：共用单端口的公钥路由网关</h2><p>TCP&#x2F;TLS 可以靠 SNI 区分域名共用 443 端口，但原生 SSH 协议握手阶段根本没有类似 Host 头的字段。想让所有用户都连同一个入口地址和端口（比如 <code>ssh devbox@ssh.example.com -p 22</code>），就得想办法在握手阶段认出“当前连上来的是哪个 DevBox 实例”。</p>
+<h3 id="1-靠客户端公钥反查实例与自定义密钥回退"><a href="#1-靠客户端公钥反查实例与自定义密钥回退" class="headerlink" title="1. 靠客户端公钥反查实例与自定义密钥回退"></a>1. 靠客户端公钥反查实例与自定义密钥回退</h3><p>Controller 在初始化每个 DevBox 时，都会生成一对专属的 SSH 密钥存进同名 Secret（<code>SEALOS_DEVBOX_PUBLIC_KEY</code> 和 <code>SEALOS_DEVBOX_PRIVATE_KEY</code>），用户下载的 SSH 配置里默认就带着这把私钥。</p>
+<p><code>sshgate</code> 利用 client-go Informer 同时监听集群里带 <code>app.kubernetes.io/part-of=devbox</code> 标签的 Secret 和 Pod，在内存里维护两张表：</p>
+<ul>
+<li><code>publicKey.Marshal() -&gt; namespace/devboxName</code></li>
+<li><code>namespace/devboxName -&gt; DevboxInfo&#123;PodIP, PublicKey, PrivateKey&#125;</code></li>
+</ul>
+<p>客户端连上来触发 <code>PublicKeyCallback</code> 时，网关直接拿对方递过来的公钥去第一张表里查，命中了就拿到目标 Pod IP，再用 Secret 里存的那把平台私钥作为客户端去连后端 Pod 的 22 端口，然后双向转发所有 SSH Channel 和 Global Request。对用户来说，用户名填什么都行，体验跟直连一台独立机器没区别。</p>
+<p>不过光靠平台生成的密钥还不够——不少开发者习惯用自己本机现成的 <code>~/.ssh/id_ed25519.pub</code>（自己把公钥塞进了容器的 <code>authorized_keys</code>）。这种情况下网关内存表里查不到他的个人公钥，<code>PublicKeyCallback</code> 就会退回到第二种模式：解析登录用户名（格式编码了短 namespace 和 devbox 名，例如 <code>devbox@ns-mybox</code>）定位目标实例，然后走下面的 Agent Forwarding 或 ProxyJump。</p>
+<h3 id="2-多副本一致的确定性-HostKey"><a href="#2-多副本一致的确定性-HostKey" class="headerlink" title="2. 多副本一致的确定性 HostKey"></a>2. 多副本一致的确定性 HostKey</h3><p><code>sshgate</code> 线上是 Deployment 多副本挂在负载均衡后面的。如果每个副本启动时随机生成自己的 Server HostKey，客户端每次重连落到不同 Pod 上都会弹那个经典的 <code>REMOTE HOST IDENTIFICATION HAS CHANGED!</code> 警告直接拒绝连接。</p>
+<p>为了省掉额外挂载和轮转证书文件的麻烦，<code>hostkey</code> 模块直接拿环境变量里的 <code>SSH_HOST_KEY_SEED</code> 做一次 <code>SHA-256</code> 得到 32 字节摘要，喂给 <code>ed25519.NewKeyFromSeed</code> 生成确定性私钥。只要同集群配置的 seed 一样，任意扩缩容出来的网关副本指纹完全一致。</p>
+<h3 id="3-Agent-Forwarding-与-ProxyJump-的协议细节"><a href="#3-Agent-Forwarding-与-ProxyJump-的协议细节" class="headerlink" title="3. Agent Forwarding 与 ProxyJump 的协议细节"></a>3. Agent Forwarding 与 ProxyJump 的协议细节</h3><p>支持用户自带密钥时，网关手里是没有用户私钥的，没法替他向后端 <code>sshd</code> 签名认证，只能做跳板转发。这里实现了两种方式：</p>
+<p>第一种是 <strong>SSH Agent Forwarding</strong>。这里有个 OpenSSH 协议实现上的坑：按照规范，<code>auth-agent-req@openssh.com</code> 不是连接级的请求，而是打开 <code>session</code> Channel 之后发过来的 <strong>Channel Request</strong>，并且客户端往往会紧跟着连发 <code>pty-req</code>、<code>env</code>、<code>shell</code> 或 <code>exec</code> 请求。但这时候网关还没拿到 Agent 通道，连后端 Pod 的连接都还没建起来。</p>
+<p>如果在建好后端连接前把这些请求丢了，终端就会卡死或者丢环境变量。所以在 <code>handleSessionRequests</code> 里专门做了一段前置缓冲：先接住客户端的 session channel，在一个带超时的循环里拦截 <code>auth-agent-req@openssh.com</code> 主动向客户端打开 <code>auth-agent@openssh.com</code> 通道拿来拨通后端 Pod，同时把这期间收到的非 agent 请求（最多缓存 6 个）暂存下来，等后端 session channel 打开后再按原顺序回放过去。</p>
+<p>第二种是 <strong>ProxyJump（<code>direct-tcpip</code>）</strong>。用户配了 <code>-J</code> 跳板机时，客户端会发来 <code>direct-tcpip</code> 类型的 Channel。为了防止有人拿网关当通用内网跳板去扫集群里的其他 IP，<code>handleProxyJumpMode</code> 解析完请求报文后<strong>直接忽略客户端声明的 <code>HostToConnect</code> 和 <code>PortToConnect</code></strong>，强制只往当前认证绑定的那个 <code>PodIP:22</code> 拨号建隧道。</p>
+<p>另外，双向拷贝 Channel 数据时如果一端刚打完输出就关连接，很容易把 <code>exit-status</code> 请求丢在半路，导致远端跑自动化脚本拿不到退出码，这块也专门做了同步等待收尾。</p>
+<h2 id="HTTPGate：用-Rust-Pingora-做无外部存储的动态反代"><a href="#HTTPGate：用-Rust-Pingora-做无外部存储的动态反代" class="headerlink" title="HTTPGate：用 Rust + Pingora 做无外部存储的动态反代"></a>HTTPGate：用 Rust + Pingora 做无外部存储的动态反代</h2><p>业务端口预览和容器内 Agent 通信走的是七层网关 <code>httpgate</code>，这块用 Rust 和 Cloudflare 开源的 <code>pingora</code> 写的，核心诉求就两个：内存占用足够省，以及同时吃下普通 HTTP&#x2F;1.1（含 WebSocket 升级）和明文 gRPC（h2c）。</p>
+<h3 id="1-双层-DashMap-索引与-PartialPod-裁剪"><a href="#1-双层-DashMap-索引与-PartialPod-裁剪" class="headerlink" title="1. 双层 DashMap 索引与 PartialPod 裁剪"></a>1. 双层 DashMap 索引与 PartialPod 裁剪</h3><p><code>httpgate</code> 不依赖 Redis 或数据库，路由信息全部来自 K8s Watch。域名规则定死为：</p>
+<pre><code class="language-text">devbox-&lt;uniqueID&gt;-&lt;port&gt;.&lt;domain&gt;
+</code></pre>
+<p>其中 <code>uniqueID</code> 是 Controller 初始化 DevBox 时生成的一串随机词（存放在 <code>status.network.uniqueID</code>），<code>port</code> 可以是具体端口号（如 <code>8080</code>），也可以是特殊关键字 <code>agent</code>（自动映射到配置的容器内 agent 端口）。</p>
+<p>为了不让 CRD 状态变更和 Pod 重建互相耦合，<code>DevboxRegistry</code> 里拆成了两个完全独立的 <code>DashMap</code>，分别由两个后台 Tokio task 维护：</p>
+<ul>
+<li><code>DevboxWatcher</code>：监听 <code>Devbox</code> CRD，维护 <code>uniqueID -&gt; (namespace, devbox_name)</code>；</li>
+<li><code>PodWatcher</code>：监听带 <code>app.kubernetes.io/part-of=devbox</code> 标签的 Pod，从 <code>ownerReferences</code> 里取出所属 DevBox 名字，维护 <code>namespace/devbox_name -&gt; pod_ip</code>。</li>
+</ul>
+<p>这里做了一个很管用的内存优化。集群里一个完整 <code>corev1.Pod</code> JSON 非常大（环境变量、挂载卷、容器状态、managedFields 全在里面），而网关路由其实只需要 <code>metadata.name</code>、<code>metadata.namespace</code>、<code>metadata.ownerReferences</code> 和 <code>status.podIP</code> 这几个字段。我们在 <code>partial.rs</code> 里自定义了 <code>PartialPod</code> 结构体并手动实现 <code>kube::api::Resource</code>，反序列化时直接丢掉整个 <code>spec</code> 和无关 <code>status</code>，加上初始 List 设了分页（<code>page_size(100)</code>），常驻内存能省掉七八成，启动瞬间也不会冲高内存峰值。</p>
+<p>请求进来时走两步查表，把“没这个实例”和“实例停机了”明确区分开：</p>
+<ul>
+<li>第一张表没查到 <code>uniqueID</code> -&gt; 直接回 <code>404 devbox not found</code>；</li>
+<li>第一张表有、但第二张表没 <code>PodIP</code>（比如处于 <code>Paused</code> 或 <code>Stopped</code>） -&gt; 回 <code>503 devbox not running</code>。</li>
+</ul>
+<h3 id="2-同时转发-HTTP-1-1-与明文-gRPC（h2c）"><a href="#2-同时转发-HTTP-1-1-与明文-gRPC（h2c）" class="headerlink" title="2. 同时转发 HTTP&#x2F;1.1 与明文 gRPC（h2c）"></a>2. 同时转发 HTTP&#x2F;1.1 与明文 gRPC（h2c）</h3><p>除了普通的网页预览，部分内部工具链会通过 <code>&lt;uniqueID&gt;-agent.&lt;domain&gt;</code> 跟容器里的服务走 gRPC 通信。Ingress 卸掉外层 TLS 后，打到 <code>httpgate</code> 上的流量是明文的。</p>
+<p>Pingora 默认监听口只按 HTTP&#x2F;1.1 处理明文连接，所以启动服务时要显式把 Server 的 <code>HttpServerOptions.h2c</code> 打开。到了 <code>request_filter</code> 阶段：</p>
+<ol>
+<li>优先从 HTTP&#x2F;1.1 的 <code>Host</code> 头取域名；如果是 HTTP&#x2F;2 请求没有 <code>Host</code> 头，就回退读 <code>:authority</code> 伪头部。</li>
+<li>判断如果当前连接版本是 <code>Version::HTTP_2</code> 且 <code>content-type</code> 以 <code>application/grpc</code> 开头，就在请求上下文里标为 <code>UpstreamProtocol::Grpc</code>。</li>
+<li>在 <code>upstream_peer</code> 构造上游 <code>HttpPeer</code> 时，一旦识别为 <code>Grpc</code>，把 <code>peer.options.alpn</code> 设成 <code>ALPN::H2</code>，让 Pingora 用明文 HTTP&#x2F;2 去连后端 Pod IP；其余请求一律保持 HTTP&#x2F;1.1。</li>
+</ol>
+<p>另外 Pingora 默认在连不上上游时只会吐一个空 body 的 502，前端或调试者很难分清是外层 Ingress 挂了还是容器里没监听那个端口，所以我们重写了 <code>fail_to_proxy</code>，按 <code>ErrorSource::Upstream / Downstream / Internal</code> 分类写回带明确原因的响应体（客户端自己断开的读写错误则直接置 0 静默收掉）。</p>
+<div class="post-tags"><a class="post-tag-link" href="/tags/devbox/" rel="tag">#devbox</a>, <a class="post-tag-link" href="/tags/kubernetes/" rel="tag">#kubernetes</a>, <a class="post-tag-link" href="/tags/pingora/" rel="tag">#pingora</a>, <a class="post-tag-link" href="/tags/rust/" rel="tag">#rust</a>, <a class="post-tag-link" href="/tags/ssh/" rel="tag">#ssh</a></div></article><div id="paginator"></div></div></div><div id="bottom-outer"><div id="bottom-inner"><hr><div><div><a>2026@ </a></div></div></div></div></div></body><script src="/js/oasis.js"></script></html>

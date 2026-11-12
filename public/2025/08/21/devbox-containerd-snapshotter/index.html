@@ -1,0 +1,68 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>DevBox 总结（二）：基于 LVM Thin Pool 的 Containerd Snapshotter 与镜像提交方案 │ lingdie's blog</title><link rel="stylesheet" href="/css/oasis.css"><meta name="generator" content="Hexo 7.3.0"><link rel="alternate" href="/atom.xml" title="lingdie's blog" type="application/atom+xml">
+</head><body><div id="content"><h1 id="title">DevBox 总结（二）：基于 LVM Thin Pool 的 Containerd Snapshotter 与镜像提交方案</h1><div id="menu-outer"><nav id="menu-inner"><a id="menu-back" href="javascript:history.back()">Back</a><time datetime="2025-08-21T12:42:00.000Z">2025-08-21</time></nav></div><div id="content-outer"><div id="content-inner"><article id="post"><p>上一篇聊了 DevBox 的 Controller 怎么和节点上的 <code>commit-worker</code> 配合，这篇往下扎一层，聊聊宿主机上的 containerd、<code>devbox</code> snapshotter、容器读写层 commit 以及 RW 层容量监控是怎么做出来的。</p>
+<h2 id="为什么原生-overlayfs-不够用"><a href="#为什么原生-overlayfs-不够用" class="headerlink" title="为什么原生 overlayfs 不够用"></a>为什么原生 overlayfs 不够用</h2><p>默认 containerd 用的 <code>overlayfs</code> snapshotter 把容器读写层（<code>upperdir</code>）直接建在宿主机根盘或数据盘的普通目录上，放在多租户云开发环境里主要有三个问题：</p>
+<ol>
+<li><strong>容量限制不好控</strong>：不做文件系统 project quota 的话，单个用户在容器里 <code>dd</code> 一个大文件就能把整台节点的 containerd 分区打满；而 K8s 原生的 <code>ephemeral-storage</code> 靠周期扫描目录驱逐 Pod，反应慢且粗暴，驱逐完读写层也没了。</li>
+<li><strong>Pod 重建后读写层解耦难</strong>：标准 CRI 的容器生命周期跟 snapshot 强绑定，Pod 一删，对应的 active snapshot 就被清掉了，没法做到“Paused 删掉 Pod 释放 CPU&#x2F;内存，但把这块读写层原封不动留在节点上等下次挂载”，也没法在 Pod 退出后再单独挂起这块读写层慢慢做 commit。</li>
+<li><strong>反复停启导致镜像层无限叠高</strong>：如果每次 <code>Stopped</code> 都往原镜像顶上追加一层 diff，用户停启几十次以后镜像层数就炸了，甚至撞上 overlayfs 的最大层数限制（128 层），历史垃圾文件也一直占着体积。</li>
+</ol>
+<p>针对这几个痛点，我们在定制版的 <code>labring/containerd</code> 里加了 <code>devbox</code> snapshotter（基于 overlay 改造，底层接 LVM Thin Pool），同时改了 <code>labring/nerdctl</code> 的 commit 逻辑来配合。</p>
+<h2 id="Devbox-Snapshotter-的存储与挂载原理"><a href="#Devbox-Snapshotter-的存储与挂载原理" class="headerlink" title="Devbox Snapshotter 的存储与挂载原理"></a>Devbox Snapshotter 的存储与挂载原理</h2><p>节点的 containerd 配置里会注册一套独立的 runtime handler <code>devbox-runc</code>，绑定到 <code>devbox</code> snapshotter：</p>
+<pre><code class="language-toml">[plugins.&quot;io.containerd.grpc.v1.cri&quot;.containerd.runtimes.devbox-runc]
+  runtime_type = &quot;io.containerd.runc.v2&quot;
+  snapshotter = &quot;devbox&quot;
+
+[plugins.&quot;io.containerd.snapshotter.v1.devbox&quot;]
+  root_path = &quot;/var/lib/containerd/io.containerd.snapshotter.v1.devbox&quot;
+  upperdir_label = true
+  sync_remove = false
+  lvm_vg_name = &quot;devbox-vg&quot;
+  thin_pool_name = &quot;devbox-vg-thinpool&quot;
+</code></pre>
+<p>K8s 侧通过 <code>RuntimeClass</code>（默认 <code>devbox-runtime</code>）把 DevBox Pod 路由到 <code>devbox-runc</code>。普通镜像只读层（lowerdir）依然走普通目录解压，只有带了 DevBox 特定 snapshot label 的容器可写层，才会触发 LVM Thin Volume 逻辑。</p>
+<h3 id="用-BoltDB-把-contentID-和-LV-绑在一起"><a href="#用-BoltDB-把-contentID-和-LV-绑在一起" class="headerlink" title="用 BoltDB 把 contentID 和 LV 绑在一起"></a>用 BoltDB 把 contentID 和 LV 绑在一起</h3><p>Controller 创建 Pod 时，会在注解上带 <code>devbox.sealos.io/content-id</code> 和 <code>devbox.sealos.io/storage-limit</code>，传到 snapshotter 时对应下面几个 label：</p>
+<ul>
+<li><code>containerd.io/snapshot/devbox-content-id</code></li>
+<li><code>containerd.io/snapshot/devbox-storage-limit</code></li>
+<li><code>containerd.io/snapshot/devbox-init</code></li>
+</ul>
+<p><code>snapshots/devbox</code> 在原有的 BoltDB 元数据存储里多开了一个 <code>DevboxStoragePathBucket</code>，专门维护 <code>contentID -&gt; &#123;lvName, snapshotKey, path, status&#125;</code> 的映射。</p>
+<p>当 <code>Prepare</code>（即 <code>createSnapshot</code>）被调用且带有 <code>content-id</code> 和 <code>storage-limit</code> 时，分两种情况走：</p>
+<p><strong>1. 首次创建该 <code>contentID</code></strong>：<br>在配置的 <code>lvm_vg_name / thin_pool_name</code> 里切出一块名为 <code>devbox-&lt;contentID&gt;</code> 的 thin LV，大小按 <code>storage-limit</code> 设定（天然硬配额，写满只会让这个容器自己报 <code>no space left on device</code>，不会冲垮宿主机），格式化成 <code>ext4</code>，挂载到当前 snapshot 目录（<code>snapshots/&lt;id&gt;</code>），并在里面建好 overlay 需要的 <code>fs</code>（即 <code>upperdir</code>）和 <code>work</code> 目录。如果中间任何一步出错，<code>defer</code> 里会自动 <code>umount</code> 并强删这块 LV，避免残留孤儿卷。</p>
+<p><strong>2. 复用已有的 <code>contentID</code>（比如 Paused 后恢复，或者停机后拉起影子容器做 Commit）</strong>：<br>查 BoltDB 发现这个 <code>contentID</code> 底下已经有 <code>lvName</code> 了，就不再新建 LV。先调 <code>resizeLVMVolume</code> 看配额有没有调大，然后更新 BoltDB 里的关联 <code>snapshotKey</code> 和挂载路径，直接把原来的 <code>/dev/&lt;vg&gt;/devbox-&lt;contentID&gt;</code> 挂载到新 snapshot 的目录上。之前写进 <code>fs/</code> 里的数据就原样接上了。</p>
+<p>这里有个很容易踩的细节：<strong>同一个 LV 同一时刻不能挂在两个 active snapshot 下</strong>。所以在旧容器退掉、新容器（或影子 commit 容器）创建之前，需要先通过 snapshotter 的 <code>Update</code> 接口给旧 snapshot 打上 <code>containerd.io/snapshot/devbox-unmount-lvm = &quot;true&quot;</code> 标签。snapshotter 收到这个更新后，会在写事务里把 BoltDB 中绑定的旧 <code>snapshotKey</code> 清掉，并调 <code>syscall.Unmount</code> 卸载旧挂载点，把这块 LV 释放出来给下一个消费者挂。</p>
+<h2 id="停机-Commit-流程与层合并优化"><a href="#停机-Commit-流程与层合并优化" class="headerlink" title="停机 Commit 流程与层合并优化"></a>停机 Commit 流程与层合并优化</h2><p>Pod 被删掉之后，CRI 建的那个容器和 sandbox 其实已经没了，那 <code>commit-worker</code> 怎么把留在 LV 里的数据打成镜像？</p>
+<p>做法是在 <code>commit.go</code> 里利用 <code>nerdctl</code> 的包能力，在 <code>k8s.io</code> 命名空间下<strong>创建一个不启动的影子容器（CreateContainer without Task）</strong>：</p>
+<ul>
+<li>指定相同的 <code>baseImage</code>、<code>contentID</code> 和 <code>storageLimit</code>；</li>
+<li><code>InRun: false</code>、<code>Restart: &quot;no&quot;</code>、<code>NetworkMode: &quot;none&quot;</code>（特别注意不能注册进 containerd 的 restart monitor，否则它会一直轮询一个根本不存在的 task）；</li>
+<li>容器创建过程中，snapshotter 看到相同的 <code>contentID</code>，就会把刚才解绑出来的那块 LV 挂到这个影子容器的 snapshot 上；</li>
+<li>接着直接对这个影子容器执行 <code>container.Commit</code>，把 <code>upperdir</code>（也就是 LV 里的 <code>fs</code> 目录）跟 <code>parent</code> 做 diff 导出成新层，生成镜像后推往内部 Registry。</li>
+</ul>
+<p>这里面做了几处专门针对生产环境的改造：</p>
+<h3 id="1-避免层数无限叠加（mergeBaseImageTopLayer）"><a href="#1-避免层数无限叠加（mergeBaseImageTopLayer）" class="headerlink" title="1. 避免层数无限叠加（mergeBaseImageTopLayer）"></a>1. 避免层数无限叠加（mergeBaseImageTopLayer）</h3><p>如果用户每次停机都往镜像上叠一层，用久了层数一定会失控。我们在 CRD 里加了 <code>mergeBaseImageTopLayer</code> 开关，两头配合把“上一次 commit 出来的用户层”和“这一次的新改动”拍平：</p>
+<ul>
+<li><strong>启动挂载阶段</strong>：当这个实例已经 commit 过（带有 <code>devbox-init</code> 标记）时，snapshotter 在 <code>createSnapshot</code> 里会把新 snapshot 的 <code>directParent</code> 往上提一层（跳过原镜像的最顶层），然后把原镜像顶层目录里的文件直接拷贝进新建的 LV <code>fs/</code> 目录里。</li>
+<li><strong>停机 Commit 阶段</strong>：在定制版 <code>labring/nerdctl</code> 的 <code>Commit</code> 实现里加了 <code>RemoveBaseImageTopLayer</code> 选项。生成新镜像的 <code>ImageConfig</code> 和 <code>Manifest</code> 时，直接裁掉 <code>baseConfig.RootFS.DiffIDs</code>、<code>History</code> 以及 <code>baseMfst.Layers</code> 的最后一项，再把当前 LV 导出的完整 diff 层追加上去。</li>
+</ul>
+<p>这样不管用户反复停启多少次，基础环境层保持不变，顶上永远只有一层最新的用户工作区数据。</p>
+<h3 id="2-Commit-Lease-与-GC-保护"><a href="#2-Commit-Lease-与-GC-保护" class="headerlink" title="2. Commit Lease 与 GC 保护"></a>2. Commit Lease 与 GC 保护</h3><p>大体积开发环境做 diff 导出（尤其是开了压缩或 eStargz 转换）耗时不短。如果中途正好撞上 containerd 的垃圾回收，还没写进最终 manifest 引用树的临时 blob 很容易被 GC 清掉。所以在 <code>nerdctl</code> 的 <code>Commit</code> 入口显式加了带过期时间的 <code>client.WithLease</code>（<code>CommitLeaseDuration</code> 可配），并在写完新 manifest 和 config blob 时完整打好 <code>containerd.io/gc.ref.content.*</code> 和 <code>containerd.io/gc.ref.snapshot.&lt;sn&gt;</code> 标签，保证整个链路不断引用。</p>
+<h3 id="3-Stargz-eStargz-加速支持"><a href="#3-Stargz-eStargz-加速支持" class="headerlink" title="3. Stargz &#x2F; eStargz 加速支持"></a>3. Stargz &#x2F; eStargz 加速支持</h3><p>除了默认的 <code>devbox</code> snapshotter，Controller 也兼容了 <code>devbox-stargz-runtime</code>。用 eStargz 跑按需拉取时，要求基础镜像本身是 eStargz 格式。我们在 <code>ensureBaseImageForSnapshotter</code> 里加了一道检查：拉下基础镜像后先扫一遍 manifest layers 里有没有 <code>containerd.io/snapshot/stargz/toc.digest</code> 注解；如果有普通层，就在本机用 <code>estargzconvert</code> 原地转成 eStargz（已转换的层直接跳过），并且外层包了一个 <code>singleflight.Group</code>，防止同一台节点上同时拉起多个同模板 DevBox 时重复做镜像转换把 CPU 打满。</p>
+<h2 id="异步回收-LV-与节点-Patch-交付"><a href="#异步回收-LV-与节点-Patch-交付" class="headerlink" title="异步回收 LV 与节点 Patch 交付"></a>异步回收 LV 与节点 Patch 交付</h2><p>LV 的清理走的是异步标记回收（配置里 <code>sync_remove = false</code>，对应 <code>AsynchronousRemove</code>）：</p>
+<p>当 DevBox 进入 <code>Stopped</code>（已推完镜像）或者被彻底删除时，<code>commit-worker</code> 会调 <code>SetLvRemovable</code>，给对应 snapshot 打上 <code>containerd.io/snapshot/devbox-remove-content-id = &lt;contentID&gt;</code> 标签，把 BoltDB 里的状态标成 <code>Removed</code>，再删掉容器和临时镜像。真正耗时的目录清理、检查 <code>/proc/mounts</code> 兜底卸载（同时处理 <code>/dev/mapper/...</code> 软链解析）以及 <code>lvremove</code> 销毁逻辑卷，统一收口在 snapshotter 的 <code>Cleanup</code> 周期任务里做，避免阻塞主流程。</p>
+<p>至于这套定制版 containerd 怎么装到存量 K8s 节点上，我们在仓库里维护了 <code>containerd/patch</code> 镜像：</p>
+<ul>
+<li>启动前先校验宿主机 VG 和 LV 的 <code>segtype</code> 确实是 <code>thin-pool</code>（脚本只做校验，绝不擅自格式化或改客户的 LVM 结构）；</li>
+<li>把原生的 <code>/usr/bin/containerd</code> 和 <code>/etc/containerd/config.toml</code> 备份到 <code>/var/lib/devbox-containerd-patch/original</code>；</li>
+<li>用 <code>awk</code> 幂等剥掉旧的 devbox 配置块再重新渲染写入，只有 <code>cmp -s</code> 发现二进制或配置真变了才重启 <code>containerd -&gt; kubelet -&gt; image-cri-shim</code>；</li>
+<li>调 <code>ctr plugins ls</code> 确认 <code>io.containerd.snapshotter.v1 devbox</code> 状态是 <code>ok</code> 后，再给节点打上 <code>devbox.sealos.io/node</code> 标签和可选的 <code>NoSchedule</code> 污点；卸载时反向恢复备份即可。</li>
+</ul>
+<h2 id="节点本地采集-RW-层容量"><a href="#节点本地采集-RW-层容量" class="headerlink" title="节点本地采集 RW 层容量"></a>节点本地采集 RW 层容量</h2><p>有了 <code>storage-limit</code> 硬配额之后，用户在界面上得能看到自己的读写层用了多少空间，不然磁盘写满了连 SSH 都登不上去还不知道原因。</p>
+<p>这块数据在节点本地，如果让 <code>commit-worker</code> 周期性扫完写回 <code>Devbox.Status</code>，几百个实例每 30 秒刷一次，APIServer、etcd 还有 watch <code>Devbox</code> 的所有组件都会被无意义的 <code>resourceVersion</code> 变更淹没。另外我们也不想在业务容器外头直接跑 <code>lvs</code> 命令去解析输出。</p>
+<p>最后的做法是在 <code>commit-worker</code> 进程内挂了一个 <code>RWStorageCollector</code>，复用它的 <code>/metrics</code> 端口通过 <code>VMServiceScrape</code> 接进 VictoriaMetrics：</p>
+<ol>
+<li>采集器只筛 <code>commitRecord.Node == NODE_NAME</code> 的本机 DevBox，并且对外暴露的 Prometheus 指标只带 <code>namespace / devbox / node / snapshotter</code> 四个标签，<strong>故意不带 <code>contentID</code></strong>，防止每次停启切换 <code>contentID</code> 造成时间序列高基数膨胀。</li>
+<li>对 <code>spec.state == Running</code> 的实例，通过 <code>content-id</code> label 找到对应 snapshot，直接调 containerd 标准接口 <code>snapshotService.Usage(ctx, snapshotName)</code> 拿字节数（底层由 snapshotter 对 active snapshot 的 <code>upperPath</code> 做 <code>fs.DiskUsage</code>），同时把 <code>devbox_rw_storage_collect_active</code> 置为 <code>1</code>。</li>
+<li>一旦 <code>spec.state</code> 切到 <code>Paused / Stopped / Shutdown</code>，立刻停止对它的 <code>Walk</code> 和 <code>Usage</code> 调用（否则停机清理 LV 的窗口期会报一堆 <code>snapshot_not_found</code> 假错误），但只要当前 <code>contentRecord</code> 还在本节点，内存里会<strong>保留最后一次成功采集到的 <code>used_bytes</code> 和 <code>usage_ratio</code></strong>，仅把 <code>collect_active</code> 置为 <code>0</code>。前端看到 <code>collect_active=0</code> 就知道这是停机前最后一次水位，体验上不会一停机监控图就断成空白。</li>
+</ol>
+<div class="post-tags"><a class="post-tag-link" href="/tags/containerd/" rel="tag">#containerd</a>, <a class="post-tag-link" href="/tags/devbox/" rel="tag">#devbox</a>, <a class="post-tag-link" href="/tags/estargz/" rel="tag">#estargz</a>, <a class="post-tag-link" href="/tags/lvm/" rel="tag">#lvm</a>, <a class="post-tag-link" href="/tags/snapshotter/" rel="tag">#snapshotter</a></div></article><div id="paginator"></div></div></div><div id="bottom-outer"><div id="bottom-inner"><hr><div><div><a>2026@ </a></div></div></div></div></div></body><script src="/js/oasis.js"></script></html>

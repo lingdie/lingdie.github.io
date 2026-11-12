@@ -1,0 +1,79 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>DevBox 总结（一）：Controller 双层架构与状态机设计 │ lingdie's blog</title><link rel="stylesheet" href="/css/oasis.css"><meta name="generator" content="Hexo 7.3.0"><link rel="alternate" href="/atom.xml" title="lingdie's blog" type="application/atom+xml">
+</head><body><div id="content"><h1 id="title">DevBox 总结（一）：Controller 双层架构与状态机设计</h1><div id="menu-outer"><nav id="menu-inner"><a id="menu-back" href="javascript:history.back()">Back</a><time datetime="2025-07-14T13:18:00.000Z">2025-07-14</time></nav></div><div id="content-outer"><div id="content-inner"><article id="post"><p>DevBox 做的是跑在 K8s 上的云端开发环境。和普通无状态服务不太一样，开发环境有两个硬需求：一是用户在容器里装的包、改的代码不能因为 Pod 重建就丢；二是实例在不活跃时要能停掉省计算资源，下次拉起还能接着用，甚至能把当前环境打成镜像发版（<code>DevBoxRelease</code>）。</p>
+<p>如果全靠挂载网络存储（PVC）来做，只有 <code>/home</code> 之类特定目录能持久化，<code>apt install</code> 写进根文件系统的内容留不住；所以我们底层走的是自定义 snapshotter + 镜像 commit 的路子。但这会直接影响 Controller 的架构设计——因为 K8s 资源是集群全局的，而容器的读写层（RW layer）和 containerd socket 是节点本地的。</p>
+<p>这篇主要记录一下 DevBox Controller 在控制面拆分、调度协同、状态流转以及发版 retag 上的做法。</p>
+<h2 id="为什么要拆成全局-Controller-和节点-DaemonSet"><a href="#为什么要拆成全局-Controller-和节点-DaemonSet" class="headerlink" title="为什么要拆成全局 Controller 和节点 DaemonSet"></a>为什么要拆成全局 Controller 和节点 DaemonSet</h2><p>最早如果把所有逻辑塞进一个中心化的 Deployment Controller，很快就会碰壁：Pod 停掉以后，要把它在宿主机上的读写层 commit 成镜像并推送到仓库，就必须连那台机器上的 <code>/run/containerd/containerd.sock</code>，清理本地快照和 LVM 逻辑卷也是一样。中心 Controller 没法直接跨节点干这些活。</p>
+<p>反过来，如果只跑一个 DaemonSet，让每个节点自己管全套 K8s 资源（Pod、Service、Secret、RBAC），没有选主的情况下多副本同时写同一个 CR 的 Status 又很容易打架。</p>
+<p>最后落下来的方案是把控制面拆成两层，共用同一套代码仓库但按角色启动：</p>
+<ol>
+<li><strong>全局 <code>DevboxReconciler</code>（Deployment，开启 Leader Election）</strong>：只跟 APIServer 打交道，管 Secret、Startup ConfigMap、Service、KubeAccess RBAC 和 Pod 的编排，维护 <code>Devbox</code> 的整体状态和 Condition，完全不碰 containerd。</li>
+<li><strong>节点 <code>DevboxNodeReconciler</code>（<code>commit-worker</code> DaemonSet，不选主）</strong>：每台工作节点跑一个实例，挂载宿主机的 containerd socket 和数据目录，通过 Downward API 拿到 <code>NODE_NAME</code>。它虽然也 watch <code>Devbox</code> CR，但只认领 <code>currentRecord.Node == r.NodeName</code> 的对象，专门干节点本地的 commit、push、存储清理以及 RW 层容量采集。</li>
+</ol>
+<p>两边不通过 RPC 通信，完全靠 <code>Devbox.Status</code> 里的 <code>contentID</code> 和 <code>commitRecords</code> 做交接。</p>
+<h2 id="把节点选择交还给-kube-scheduler"><a href="#把节点选择交还给-kube-scheduler" class="headerlink" title="把节点选择交还给 kube-scheduler"></a>把节点选择交还给 kube-scheduler</h2><p>早期做本地存储绑定的控制器，很容易写成“Controller 自己先挑一台节点写进 Status，再把 <code>nodeName</code> 硬编码进 Pod Spec”。这样写一开始省事，后面接 GPU（比如原生 <code>nvidia.com/gpu.product</code> 或 HAMi 调度）、节点亲和性、扩展资源配额时就会非常别扭，等于把调度器干的活在 Controller 里重抄一遍，还经常因为缓存延迟选出根本排不上去的节点。</p>
+<p>在 <code>v1alpha2</code> 里我们改成了观察式绑定：</p>
+<ul>
+<li>当 <code>spec.state == Running</code> 且当前 <code>commitRecord.Node</code> 为空时，全局 Controller 只同步前置依赖（Secret、启动配置、RBAC）并创建不带硬指定节点的 Pod，让 <code>kube-scheduler</code> 正常走完过滤和打分。</li>
+<li>Pod 被调度器绑定到具体节点后，<code>syncAssignedNodeFromPod</code> 把 <code>pod.Spec.NodeName</code> 反写回当前 <code>commitRecord.Node</code>，然后立刻 <code>Requeue</code> 一轮，再跑完整的同步流水线。</li>
+<li>后续如果只是 <code>Paused -&gt; Running</code> 恢复，因为本地 LV 还在原节点上，Controller 才会根据记录里的节点信息把新 Pod 固定回原节点；如果是 <code>Stopped</code> 之后再启动，数据已经进镜像仓库了，就生成新的 <code>contentID</code>，重新交给调度器选节点，实现跨节点漂移。</li>
+</ul>
+<h2 id="四种状态与-contentID-演进"><a href="#四种状态与-contentID-演进" class="headerlink" title="四种状态与 contentID 演进"></a>四种状态与 contentID 演进</h2><p><code>DevboxSpec.State</code> 定义了四个状态，区别主要落在“算力释放到哪一步”和“本地存储留不留”：</p>
+<ul>
+<li><code>Running</code>：Pod 正常运行，读写层挂在当前节点的 LVM 瘦供给卷（thin LV）上。</li>
+<li><code>Paused</code>：删掉 Pod 释放 CPU &#x2F; 内存 &#x2F; GPU，但<strong>保留节点本地的 LV</strong>（NodePort 等网络资源也保留）。恢复的时候不需要拉取新镜像层，直接把原 LV 重新挂回去，拉起速度最快，代价是不能换节点。</li>
+<li><code>Stopped</code>：删掉 Pod，并且把当前读写层 commit 成镜像推到内部仓库，随后卸载并清理节点本地 LV。下次启动以刚提交的镜像作为新的 <code>baseImage</code>，可以调度到任意节点。</li>
+<li><code>Shutdown</code>：在 <code>Stopped</code> 的基础上把关联的 Service 等外围资源也释放掉，归档休眠场景用得多。</li>
+</ul>
+<p>为了把多次停启串起来，Status 里维护了一个 <code>contentID</code>（UUID）和 <code>commitRecords</code> 映射表：</p>
+<pre><code class="language-go">// status.contentID 指向当前生效的记录
+devbox.Status.CommitRecords[currentContentID] = &amp;devboxv1alpha2.CommitRecord&#123;
+	Node:             &quot;&quot;,
+	BaseImage:        devbox.Spec.Image,
+	CommitImage:      r.generateImageName(devbox),
+	CommitStatus:     devboxv1alpha2.CommitStatusPending,
+	GenerateTime:     metav1.Now(),
+	RuntimeClassName: runtimeClassName,
+&#125;
+</code></pre>
+<p>每次创建 Pod 时，<code>contentID</code> 会通过 <code>devbox.sealos.io/content-id</code> 注解传给容器，底层 snapshotter 看到这个标识就知道该新建还是复用哪块 LV。</p>
+<h3 id="状态切换时的跨组件握手"><a href="#状态切换时的跨组件握手" class="headerlink" title="状态切换时的跨组件握手"></a>状态切换时的跨组件握手</h3><p>最容易出竞态的地方是 <code>Running/Paused -&gt; Stopped/Shutdown</code>。此时如果全局 Controller 直接把 <code>status.state</code> 改成 <code>Stopped</code>，或者不等 Pod 退出就开始 commit，文件系统可能还有脏页没刷完，甚至容器进程还在写盘。</p>
+<p>实际流程是这么卡住顺序的：</p>
+<ol>
+<li>用户把 <code>spec.state</code> 改成 <code>Stopped</code>。</li>
+<li>全局 <code>DevboxReconciler</code> 在 <code>runSyncPipeline</code> 里先把 Pod 删掉；到了 <code>syncDevboxStateTransition</code> 这一步，判断出这次转换属于 <code>devboxStateTransitionNeedsLocalCommit</code>（目标态是 <code>Stopped/Shutdown</code>，当前态是 <code>Running/Paused</code> 且已经有归属节点），于是<strong>不推进 <code>status.state</code></strong>，而是打上 <code>StateTransitionPending=True</code> 的 Condition（<code>waiting for node-local commit worker to persist content</code>），同时也不推进 <code>ObservedGeneration</code>。</li>
+<li>所属节点上的 <code>DevboxNodeReconciler</code> 监听到变更，先调 <code>devboxPodsGone</code> 确认这个 DevBox 对应的 Pod 已经彻底消失；如果还没退干净，就 <code>RequeueAfter: 10s</code> 继续等。</li>
+<li>Pod 退干净后，节点 worker 用 <code>sync.Map</code> 按 <code>namespace/name/contentID</code> 做一层进程内去重，先把 <code>CommitStatus</code> 更新成 <code>Committing</code>（前端和 API 层看到这个状态会直接拦截新的启停请求，返回 409，避免提交中途又把实例拉起来），然后调 containerd 做 commit + push。</li>
+<li>镜像推成功、旧快照和 LV 标记清理完以后，由节点 worker 生成下一轮要用的新 <code>contentID</code> 和新 <code>CommitRecord</code>（其 <code>BaseImage</code> 指向刚刚推上去的 <code>CommitImage</code>），最后把 <code>status.state</code> 改成目标态。</li>
+</ol>
+<p>删除 <code>Devbox</code> 时也是类似的协同逻辑：全局 Controller 在 <code>reconcileDevboxDeletion</code> 里先把关联的 Pod、Service、ConfigMap、Secret 删掉（摘 Pod finalizer 时还会校验前后的 <code>Pod.UID</code> 防止误摘同名重建的 Pod），然后检查 <code>localStorageCleanupNode</code>。只要本地存储还没清完，就保留 <code>Devbox</code> 上的 finalizer 每 10 秒重入一次；等节点上的 <code>DevboxNodeReconciler</code> 确认 Pod 退出并调 <code>cleanupStorage</code> 把本地快照和 LV 回收干净后，全局 Controller 才最终摘掉 <code>devbox.sealos.io/finalizer</code>。</p>
+<h2 id="Pipeline-组织同步步骤与-KubeAccess"><a href="#Pipeline-组织同步步骤与-KubeAccess" class="headerlink" title="Pipeline 组织同步步骤与 KubeAccess"></a>Pipeline 组织同步步骤与 KubeAccess</h2><p>全局 Controller 要同步的子资源不少，如果全平铺在 <code>Reconcile</code> 里，打日志、发 Event、更新每种资源的 Condition 会写出一大堆重复模板代码。我们在 <code>devbox_sync_pipeline.go</code> 里抽了一层简单的声明式 step 结构：</p>
+<pre><code class="language-go">func (r *DevboxReconciler) syncPipelineSteps(
+	devbox *devboxv1alpha2.Devbox,
+	recLabels map[string]string,
+) []devboxSyncPipelineStep &#123;
+	return []devboxSyncPipelineStep&#123;
+		r.syncSecretStep(devbox, recLabels),
+		r.syncStartupConfigMapStep(devbox, recLabels),
+		r.syncNetworkStep(devbox, recLabels),
+		r.syncDevboxPhaseStep(devbox, recLabels),
+		r.syncKubeAccessStep(devbox, recLabels),
+		r.syncPodStep(devbox, recLabels),
+		r.syncPodReadyConditionStep(devbox, recLabels),
+	&#125;
+&#125;
+</code></pre>
+<p>每个 step 自带 <code>skip</code> 判断、成功&#x2F;失败日志、对应的 Condition 类型以及 <code>EventRecorder</code> 事件定义，<code>runSyncPipeline</code> 顺序跑下来，哪一步挂了直接把具体错误写进对应 Condition 并抛出 Warning Event，排查的时候看一眼 CR 的 <code>status.conditions</code> 就清楚卡在哪一步。</p>
+<p>顺带一提里面的 <code>syncKubeAccessStep</code>：有些用户在 DevBox 里本身就是要写 Operator 或调 <code>kubectl</code> 管理自己 namespace 下的资源。开启 <code>spec.kubeAccess.enabled</code> 后，Controller 会按 <code>view / edit / admin</code> 角色模板在用户 namespace 下自动建好专属的 ServiceAccount、Role&#x2F;RoleBinding，并通过 Projected Volume 把受限 Token 挂进容器，省去了前端再跑一套 RBAC 初始化 Job 的麻烦。</p>
+<h2 id="发版流程（DevBoxRelease）与多仓库凭据管理"><a href="#发版流程（DevBoxRelease）与多仓库凭据管理" class="headerlink" title="发版流程（DevBoxRelease）与多仓库凭据管理"></a>发版流程（DevBoxRelease）与多仓库凭据管理</h2><p>用户把开发环境调好之后，经常需要导出成一个正式版本镜像拿去部署。这块单独拆了 <code>DevBoxRelease</code> CRD 和 <code>DevboxreleaseReconciler</code>。</p>
+<p>发版有个前提：被导出的 DevBox 必须已经停稳（<code>Stopped</code>），确保最后一次改动已经通过 <code>commit-worker</code> 落成了内部仓库里的 <code>sourceImage</code>。如果用户刚点完发版、DevBox 还在停机提交的过程中，<code>DevboxreleaseReconciler</code> 检测到 <code>!isDevboxReleaseReady(devbox)</code> 会直接返回，靠 watch <code>Devbox</code> 的状态变化事件驱动下一次重入，而不是在队列里空转报错。</p>
+<p>真正执行发版时，并不需要把镜像拉下来重新打包，Controller 直接走 Registry HTTP V2 接口把 <code>status.sourceImage</code> 的 manifest retag 到目标版本标签即可；遇到源 manifest 不存在这种不可恢复错误直接置为 <code>Failed</code> 终止重试，避免无限刷接口。</p>
+<p>这里踩过一个多环境部署的坑：线上既有集群内部的私有仓库（可能是自签证书甚至 plain HTTP，返回 Bearer challenge 的行为也不太标准），又有外部的 <code>ghcr.io</code> 或客户自建 Harbor。如果全局只配死一套账密和 <code>--registry-insecure</code>，要么连不上外部 HTTPS 仓库，要么把内部仓库的凭据泄露给无关域名。</p>
+<p>后来在 <code>internal/registryconfig</code> 里做成了按规范化 host（含非默认端口）精确匹配的凭据集合：</p>
+<ul>
+<li>主仓库参数负责生成 commit 镜像地址；</li>
+<li>额外仓库通过 Secret 挂载 <code>registries.yaml</code> 注入；</li>
+<li>匹配不到配置里的域名时，退回到节点已有的 Docker credential store 或匿名访问，<strong>绝不把主仓库的账号密码发给其他域名</strong>；</li>
+<li>在 Sealos 部署脚本里，安装器会直接读取节点上的 <code>/etc/image-cri-shim.yaml</code> 自动生成默认仓库列表并注入 Secret，Secret 内容变更时滚动 Controller 和 <code>commit-worker</code>。</li>
+</ul>
+<p>这套拆法跑下来最大的感受是：凡是涉及宿主机本地状态的操作，尽量不要让中心控制面硬伸手过去管，把状态契约定义在 CRD Status 里，让全局 Reconciler 和节点 DaemonSet 各司其职，边界会干净很多。</p>
+<div class="post-tags"><a class="post-tag-link" href="/tags/controller-runtime/" rel="tag">#controller-runtime</a>, <a class="post-tag-link" href="/tags/devbox/" rel="tag">#devbox</a>, <a class="post-tag-link" href="/tags/kubernetes/" rel="tag">#kubernetes</a>, <a class="post-tag-link" href="/tags/operator/" rel="tag">#operator</a></div></article><div id="paginator"></div></div></div><div id="bottom-outer"><div id="bottom-inner"><hr><div><div><a>2026@ </a></div></div></div></div></div></body><script src="/js/oasis.js"></script></html>

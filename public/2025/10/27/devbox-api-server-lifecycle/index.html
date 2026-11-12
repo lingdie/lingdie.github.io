@@ -1,0 +1,39 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>DevBox 总结（四）：API Server、容器内命令代理与生命周期调度 │ lingdie's blog</title><link rel="stylesheet" href="/css/oasis.css"><meta name="generator" content="Hexo 7.3.0"><link rel="alternate" href="/atom.xml" title="lingdie's blog" type="application/atom+xml">
+</head><body><div id="content"><h1 id="title">DevBox 总结（四）：API Server、容器内命令代理与生命周期调度</h1><div id="menu-outer"><nav id="menu-inner"><a id="menu-back" href="javascript:history.back()">Back</a><time datetime="2025-10-27T11:53:00.000Z">2025-10-27</time></nav></div><div id="content-outer"><div id="content-inner"><article id="post"><p>除了面向浏览器用户的 Next.js 控制台，DevBox 还需要给外部系统、自动化脚本以及 AI Agent（比如类 Codex 的远程沙箱调用场景）提供一套干净的编程接口：一条请求拉起环境、执行命令、上传下载文件、按路径反代访问里面的服务，用完了到点自动暂停甚至归档释放。</p>
+<p>这块独立做成了 Go 服务 <code>server</code>（即 <code>devbox-api</code>）。如果只是把 K8s CRD 包装成 CRUD 其实没什么好说的，实际做下来真正花心思的主要是三件事：怎么绕开高开销的 <code>kubectl exec</code>、怎么做无 Redis 依赖的子路径反向代理，以及怎么实现轻量的定时休眠&#x2F;归档调度。</p>
+<h2 id="绕开-APIServer-Exec，直连-Pod-内-SDK-Server"><a href="#绕开-APIServer-Exec，直连-Pod-内-SDK-Server" class="headerlink" title="绕开 APIServer Exec，直连 Pod 内 SDK Server"></a>绕开 APIServer Exec，直连 Pod 内 SDK Server</h2><p>外部 Agent 调沙箱环境时，<code>POST /exec</code>、文件上传和文件下载是非常高频的操作。</p>
+<p>最开始如果图省事，直接调 K8s APIServer 的 <code>/pods/&#123;name&#125;/exec</code>（SPDY 或 WebSocket 升级，甚至在容器里拼 <code>tar</code> 管道传文件），并发稍微高一点问题就全暴露出来了：每次执行命令都要经过 <code>server -&gt; kube-apiserver -&gt; kubelet -&gt; containerd</code> 一长串链路，APIServer 的连接开销和审计日志压力很大，大文件走 exec 流也很容易超时断流，而且很难精确拿到标准输出、标准错误和退出码的结构化结果。</p>
+<p>所以在 v2 里，每个 DevBox 容器内部都会跑一个轻量的守护进程 <code>devbox-sdk-server</code>（监听 <code>9757</code> 端口），<code>server</code> 在集群内直接走 Pod IP 跟它通 HTTP：</p>
+<ol>
+<li><strong>鉴权隔离</strong>：每个 DevBox 初始化时，Secret 里除了 SSH 密钥还会存一份专属的 <code>SEALOS_DEVBOX_JWT_SECRET</code>（内存带 5 分钟 TTL 缓存）。<code>server</code> 校验完外部调用方的租户 JWT（从中提取绑定的 <code>namespace</code>，不允许请求体越权指定 namespace）后，再用目标 DevBox 自己的密钥签发短期 Bearer Token 去调 <code>http://&lt;podIP&gt;:9757</code>。</li>
+<li><strong>冷启动探活等待</strong>：刚恢复或刚拉起的 Pod，有时候 K8s 已经标成 <code>Running</code> 了，但里面的 <code>9757</code> 端口还没监听好。<code>resolveRunningPodAndSDKServer</code> 拿到 Pod IP 后，会先用 250ms 短连接超时、100ms 间隔做一个最多 3 秒的 <code>waitForSDKServerReachable</code> 探测，平滑吃掉容器刚启动那一两秒的抖动，避免调用方刚看到 Running 一调 <code>exec</code> 就吃 502。</li>
+<li><strong>Stdin 兼容与超时透传</strong>：同步命令执行走 <code>/api/v1/process/exec-sync</code>，结构化返回 <code>stdout</code>、<code>stderr</code> 和 <code>exitCode</code>；当调用方传了非空 <code>stdin</code> 时，自动包装命令并通过环境变量安全注入输入流，保证老接口语义不变。</li>
+</ol>
+<h2 id="双监听口与基于内存索引的子路径网关"><a href="#双监听口与基于内存索引的子路径网关" class="headerlink" title="双监听口与基于内存索引的子路径网关"></a>双监听口与基于内存索引的子路径网关</h2><p>在对接外部平台时，很多环境不方便配泛域名证书（也就是没法给每个沙箱分一个三级子域名），更希望只暴露一个固定域名，靠路径前缀来区分不同实例，比如：</p>
+<pre><code class="language-text">https://devbox-gateway.example.com/codex/&lt;uniqueID&gt;/...
+</code></pre>
+<p>为此 <code>server</code> 进程同时开了两个监听端口：<code>8090</code> 专门接带租户 JWT 鉴权的管控 REST API，<code>8091</code> 专门接 <code>/codex/&#123;uniqueID&#125;</code> 和 code-server 等应用网关流量，两边可以在外层挂不同的 Ingress 策略。</p>
+<p>为了让路径转发不依赖外部 Redis，我们在进程内维护了双映射索引（<code>uniqueID -&gt; gatewayIndexEntry</code> 和 <code>namespace/name -&gt; uniqueID</code>）：</p>
+<ul>
+<li>正常情况下通过监听 <code>Devbox</code> 资源变化实时同步 <code>status.network.uniqueID</code>；</li>
+<li>请求打到 <code>/codex/&#123;uniqueID&#125;/...</code> 时，如果本地内存索引恰好没命中（比如实例刚建出来 Informer 还没推到当前副本），<code>handleGatewayProxy</code> 会主动调一次 <code>refreshGatewayIndex</code> 做按需兜底刷新，再查不到才回 404，避免多副本短暂缓存不一致导致刚建好的沙箱打不开。</li>
+<li>转发到 <code>http://&lt;podIP&gt;:1317</code> 时，底层连的是 Pod IP，但逻辑 Host 会构造成 <code>&lt;uniqueID&gt;.&lt;namespace&gt;.svc.cluster.local:1317</code>，同时处理好路径前缀剥离和上游 <code>Location</code> 重定向改写，让跑在子路径下的 Web 服务能正常跳转。</li>
+</ul>
+<p>另外在调 <code>GET /api/v1/devbox/&#123;name&#125;</code> 查询实例详情时，接口会直接把拼好的网关 URL 和用该实例密钥签好的网关访问 Token 一并返回，外部调用方拿到就能直接连，不需要二次换票。</p>
+<h2 id="带选主的生命周期调度器（自动暂停与归档）"><a href="#带选主的生命周期调度器（自动暂停与归档）" class="headerlink" title="带选主的生命周期调度器（自动暂停与归档）"></a>带选主的生命周期调度器（自动暂停与归档）</h2><p>沙箱场景里很多实例是用完即弃或者闲置一会儿就该停掉的。如果每个实例都让业务方自己维护定时器去调 pause&#x2F;stop，客户端一挂机器就一直跑着烧钱；所以在创建和续期接口里直接支持了两个策略注解：</p>
+<ul>
+<li><code>devbox.sealos.io/pause-at</code>：到指定时间点自动从 <code>Running</code> 切到 <code>Paused</code>（释放算力，保留节点本地 LV）；</li>
+<li><code>devbox.sealos.io/archive-after-pause-time</code>：进入 <code>Paused</code> 超过指定时长后，自动切到 <code>Shutdown</code>（触发节点 commit 镜像并彻底释放本地 LV 归档）。</li>
+</ul>
+<p>同时给这类带策略的对象打上 <code>devbox.sealos.io/lifecycle-scheduled=true</code> 标签，方便过滤列表，不扫全量无关实例。</p>
+<h3 id="为什么不用固定高频轮询"><a href="#为什么不用固定高频轮询" class="headerlink" title="为什么不用固定高频轮询"></a>为什么不用固定高频轮询</h3><p>如果无脑起一个每 5 秒扫全表的协程，集群里实例多了会产生大量无意义的 List&#x2F;Patch；但如果把扫描间隔拉长到几十分钟，到点停机的精度又太差。</p>
+<p>我们在 <code>lifecycle.go</code> 里做成了一个<strong>事件唤醒 + 最近到期单 Timer + 周期全量兜底</strong>的混合模型，外层再用 <code>coordination.k8s.io/v1</code> 的 <code>LeaseLock</code>（<code>devbox-api-lifecycle</code>）做选主，保证多副本部署下同一时刻只有一个副本在跑调度循环：</p>
+<ol>
+<li><strong>内存维护 <code>nextByKey</code> 到期表</strong>：启动当选 Leader 后先做一次带 label 过滤的全量扫描（<code>reconcileLifecycleFull</code>），算出每个实例下一次需要动作的时间点（比如还没到期的 <code>pauseAt</code>，或者已经 Paused 实例的 <code>pausedAt + archiveAfterPause</code>），存进 <code>map[ObjectKey]time.Time</code>。</li>
+<li><strong>动态重置单个 <code>time.Timer</code></strong>：每次循环结束时，取整个 map 里最早的那个时间点作为下一次唤醒间隔（下限 1 秒，上限不超过兜底周期 <code>lifecycleResyncInterval</code>，默认 30 分钟）。平时没有任何轮询开销，哪个实例到点了 Timer 就精准醒过来只处理到期的 key。</li>
+<li><strong>API 写操作即时唤醒</strong>：当用户通过当前副本调了创建、修改 <code>pauseAt</code>、手动暂停&#x2F;恢复或删除接口时，Handler 会往带缓冲的 <code>lifecycleNotifyCh</code> 发一个按 key 刷新的信号，调度循环立刻更新这台实例的下次唤醒时间并重设 Timer。</li>
+<li><strong>30 分钟全量 Ticker 兜底</strong>：考虑到 API 请求可能落到非 Leader 副本上，或者有人直接用 <code>kubectl</code> 改了注解，每隔 <code>30m</code> 还会跑一次全量校准，同时自动清理那些已经没有生命周期注解的对象上的 <code>lifecycle-scheduled</code> 标签。</li>
+</ol>
+<p>在真正改状态的时候，<code>patchDevboxMetadataAndState</code> 会显式校验当前状态（比如确认此刻确实还是 <code>Running</code> 才改成 <code>Paused</code>，同时删掉已消费的 <code>pause-at</code>、写上 <code>paused-at</code> 时间戳），用 <code>RetryOnConflict</code> 防止和用户手动恢复的操作撞车。</p>
+<p>回头看整个 DevBox 后端这四块——Controller 拆开全局编排和节点本地提交、Snapshotter 用 LVM Thin Pool 管住配额和快照复用、SSH&#x2F;HTTP 网关收掉端口暴露面、API Server 把高频命令执行和生命周期托管做轻——核心思路其实一直没变：把 K8s 控制面擅长做的声明式编排留给 APIServer，把高频数据面和宿主机本地存储操作坚决剥离到直连通道和节点本地组件里去。</p>
+<div class="post-tags"><a class="post-tag-link" href="/tags/devbox/" rel="tag">#devbox</a>, <a class="post-tag-link" href="/tags/golang/" rel="tag">#golang</a>, <a class="post-tag-link" href="/tags/kubernetes/" rel="tag">#kubernetes</a>, <a class="post-tag-link" href="/tags/reverse-proxy/" rel="tag">#reverse-proxy</a></div></article><div id="paginator"></div></div></div><div id="bottom-outer"><div id="bottom-inner"><hr><div><div><a>2026@ </a></div></div></div></div></div></body><script src="/js/oasis.js"></script></html>
